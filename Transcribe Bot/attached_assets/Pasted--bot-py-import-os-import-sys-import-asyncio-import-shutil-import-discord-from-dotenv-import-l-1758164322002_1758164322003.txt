@@ -1,0 +1,455 @@
+# bot.py
+import os
+import sys
+import asyncio
+import shutil
+import discord
+from dotenv import load_dotenv
+
+# keep_alive is optional; guarded so it won't crash if you don't have it.
+try:
+    from keep_alive import keep_alive
+except Exception:
+    keep_alive = None
+
+# ─────────────────────────── ENV ───────────────────────────
+load_dotenv()
+TOKEN = os.getenv("DISCORD_TOKEN")
+
+# ───────────────────────── INTENTS ─────────────────────────
+intents = discord.Intents.default()
+intents.guilds = True
+intents.voice_states = True  # required for voice join/leave
+
+# ─────────────────────────  BOT  ──────────────────────────
+bot = discord.Bot(intents=intents)
+
+# { guild_id: {"sink": sink, "channel": TextChannel, "voice_client": VoiceClient} }
+recording_states: dict[int, dict] = {}
+
+# ─────────────── Interaction helpers (fix 40060) ──────────
+async def safe_defer(ctx: discord.ApplicationContext, *, ephemeral: bool = False):
+    """Defer only if not already deferred/responded."""
+    try:
+        if not (getattr(ctx, "deferred", False) or getattr(ctx, "responded", False)):
+            await ctx.defer(ephemeral=ephemeral)
+    except Exception:
+        pass  # already acknowledged → ignore
+
+async def send_reply(ctx: discord.ApplicationContext, *args, **kwargs):
+    """Reply correctly whether we deferred or not."""
+    if getattr(ctx, "deferred", False) or getattr(ctx, "responded", False):
+        return await ctx.followup.send(*args, **kwargs)
+    else:
+        return await ctx.respond(*args, **kwargs)
+
+# ───────────── Runtime diagnostics / opus / ffmpeg ────────
+def try_load_opus() -> tuple[bool, str]:
+    """
+    Ensure libopus is available (Windows often needs a manual DLL).
+    Tries common names and optional OPUS_DLL_PATH env var.
+    """
+    import discord.opus as opus
+    if opus.is_loaded():
+        return True, "Opus: ✅ already loaded"
+
+    # 1) Allow explicit path via env var
+    explicit = os.getenv("OPUS_DLL_PATH")
+    tried = []
+    if explicit:
+        try:
+            opus.load_opus(explicit)
+            if opus.is_loaded():
+                return True, f"Opus: ✅ loaded ({explicit})"
+        except Exception:
+            tried.append(explicit)
+
+    # 2) Try common names by platform
+    candidates = []
+    if sys.platform.startswith("win"):
+        # Most Windows builds ship as libopus-0.dll (very common),
+        # some custom builds use opus.dll/libopus.dll
+        candidates = ["libopus-0.dll", "opus.dll", "libopus.dll", "opus"]
+    elif sys.platform == "darwin":
+        candidates = ["libopus.dylib", "opus"]
+    else:
+        # Linux
+        candidates = ["libopus.so.0", "libopus.so", "opus"]
+
+    for name in candidates:
+        try:
+            opus.load_opus(name)
+            if opus.is_loaded():
+                return True, f"Opus: ✅ loaded ({name})"
+        except Exception:
+            tried.append(name)
+            continue
+
+    return False, "Opus: ❌ not loaded (tried: " + ", ".join(tried or ["<none>"]) + ")"
+
+
+def voice_runtime_ok() -> tuple[bool, str]:
+    """
+    Returns (ok, message). ok=False when PyNaCl is missing or opus not loaded.
+    """
+    # PyNaCl is required for voice crypto (receive).
+    try:
+        import nacl  # type: ignore
+        have_nacl = True
+    except Exception:
+        have_nacl = False
+
+    opus_ok, opus_msg = try_load_opus()
+    ffmpeg_path = shutil.which("ffmpeg")
+
+    parts = []
+    parts.append("PyNaCl: " + ("✅ present" if have_nacl else "❌ missing"))
+    parts.append(opus_msg)
+    parts.append("ffmpeg: " + (f"✅ {ffmpeg_path}" if ffmpeg_path else "⚠️ not found (we'll use WAV)"))
+    msg = " | ".join(parts)
+
+    return (have_nacl and opus_ok), msg
+
+def choose_sink_cls():
+    """
+    Prefer MP3 if ffmpeg is available; otherwise fall back to WAV (no external deps).
+    """
+    try:
+        import discord.sinks  # ensure sinks present
+    except Exception:
+        raise RuntimeError("This py-cord build doesn't include voice recording (discord.sinks).")
+    return discord.sinks.MP3Sink if shutil.which("ffmpeg") else discord.sinks.WaveSink
+
+# ───────────────────────── Events ─────────────────────────
+@bot.event
+async def on_ready():
+    print(f"{bot.user} has connected to Discord!")
+    ok, diag = voice_runtime_ok()
+    print("Voice Runtime →", diag)
+    try:
+        await bot.sync_commands()
+        print("✅ Slash commands synced")
+    except Exception as e:
+        print(f"Command sync error: {e}")
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    # If the bot gets kicked from VC, clear that guild's recording state.
+    if bot.user and member.id == bot.user.id:
+        if before.channel is not None and after.channel is None:
+            gid = before.channel.guild.id
+            if gid in recording_states:
+                print(f"[cleanup] Bot disconnected in guild {gid}; clearing recording state.")
+                recording_states.pop(gid, None)
+
+# ──────────────────────── Helpers ─────────────────────────
+async def _connect_with_timeout(channel: discord.VoiceChannel, *, timeout: float = 12.0):
+    """Connect to a voice channel with a hard timeout so commands never hang forever."""
+    return await asyncio.wait_for(channel.connect(), timeout=timeout)
+
+async def _move_with_timeout(vc: discord.VoiceClient, channel: discord.VoiceChannel, *, timeout: float = 12.0):
+    """Move to a voice channel with a hard timeout."""
+    await asyncio.wait_for(vc.move_to(channel), timeout=timeout)
+    return vc
+
+async def _wait_until_connected(vc: discord.VoiceClient, *, total_timeout: float = 8.0, interval: float = 0.4) -> bool:
+    """
+    Poll until vc.is_connected() becomes True (or timeout). More reliable than fixed sleeps.
+    """
+    elapsed = 0.0
+    while elapsed < total_timeout:
+        if vc.is_connected():
+            return True
+        await asyncio.sleep(interval)
+        elapsed += interval
+    return vc.is_connected()
+
+async def ensure_voice_connection(ctx: discord.ApplicationContext):
+    """
+    Join/move to the invoker's VC, verify runtime, and wait for a stable connection.
+    Returns (ok: bool, message: str)
+    """
+    # 1) Must be in a voice channel
+    if ctx.author.voice is None or ctx.author.voice.channel is None:
+        return False, "You need to be in a voice channel!"
+
+    # 2) Check runtime (PyNaCl + Opus)
+    have_runtime, diag = voice_runtime_ok()
+    if not have_runtime:
+        return False, f"Voice runtime not ready. {diag}\nInstall `PyNaCl` and ensure libopus is available."
+
+    target: discord.VoiceChannel = ctx.author.voice.channel
+    vc = ctx.voice_client
+
+    try:
+        # 3) Connect / Move with hard timeout
+        if vc is None:
+            vc = await _connect_with_timeout(target, timeout=12.0)
+        elif vc.channel != target:
+            vc = await _move_with_timeout(vc, target, timeout=12.0)
+
+        # 4) Wait until fully connected (polling instead of one big sleep)
+        ok = await _wait_until_connected(vc, total_timeout=8.0, interval=0.4)
+        if not ok:
+            # still not reporting connected — surface a helpful message but don't crash
+            return False, "Voice connection not established yet. Try `/leave` then `/join` (or check firewall/UDP)."
+
+        return True, "Connected"
+
+    except asyncio.TimeoutError:
+        return False, "Voice connect took too long (timeout). Check channel permissions and try again."
+    except discord.Forbidden:
+        return False, "I don't have permission to connect/speak in that voice channel."
+    except Exception as e:
+        return False, f"Failed to connect to voice: {e}"
+
+# ─────────────────────── Slash Commands ───────────────────
+@bot.slash_command(name="voice_stats", description="Show raw voice client stats (debug)")
+async def voice_stats(ctx: discord.ApplicationContext):
+    await safe_defer(ctx)
+    vc = ctx.voice_client
+    if not vc:
+        await send_reply(ctx, "No VoiceClient yet. Use /join first.")
+        return
+    info = [
+        f"is_connected: {vc.is_connected()}",
+        f"channel: {getattr(vc.channel, 'name', None)}",
+        f"latency: {getattr(vc, 'latency', None)}",
+        f"ws: {'ok' if getattr(vc, 'ws', None) else 'None'}",
+    ]
+    await send_reply(ctx, "\n".join(info))
+
+@bot.slash_command(name="debug_voice", description="Show voice environment diagnostics")
+async def debug_voice(ctx: discord.ApplicationContext):
+    await safe_defer(ctx)
+    ok, msg = voice_runtime_ok()
+    color = discord.Color.green() if ok else discord.Color.orange()
+    emb = discord.Embed(title="🎧 Voice Diagnostics", description=msg, color=color)
+    await send_reply(ctx, embed=emb)
+
+@bot.slash_command(name="debug_channel", description="Show voice channel and permission diagnostics")
+async def debug_channel(ctx: discord.ApplicationContext):
+    await safe_defer(ctx)
+    if ctx.author.voice is None or ctx.author.voice.channel is None:
+        await send_reply(ctx, "❌ You are not in a voice channel.")
+        return
+
+    ch = ctx.author.voice.channel
+    me = ctx.guild.get_member(bot.user.id)
+    perms = ch.permissions_for(me)
+
+    lines = []
+    lines.append(f"Channel: **{ch.name}** (type: {type(ch).__name__})")
+    lines.append(f"rtc_region: `{getattr(ch, 'rtc_region', None)}`")
+    lines.append("— Permissions for the bot in this channel —")
+    lines.append(f"View Channel: {perms.view_channel}")
+    lines.append(f"Connect: {perms.connect}")
+    lines.append(f"Speak: {perms.speak}")
+    lines.append(f"Use Voice Activity: {perms.use_voice_activation}")
+    lines.append(f"Priority Speaker: {perms.priority_speaker}")
+    lines.append(f"Mute Members: {perms.mute_members}  Deafen Members: {perms.deafen_members}")
+    lines.append(f"Move Members: {perms.move_members}")
+    await send_reply(ctx, "\n".join(lines))
+
+@bot.slash_command(name="force_reconnect", description="Disconnect (if any) and reconnect to your voice channel with a fresh session")
+async def force_reconnect(ctx: discord.ApplicationContext):
+    await safe_defer(ctx)
+    if ctx.author.voice is None or ctx.author.voice.channel is None:
+        await send_reply(ctx, "❌ You need to be in a voice channel.")
+        return
+    # Hard reset the voice client session
+    try:
+        if ctx.voice_client:
+            await ctx.voice_client.disconnect(force=True)
+            await asyncio.sleep(0.8)
+    except Exception:
+        pass
+    try:
+        vc = await asyncio.wait_for(ctx.author.voice.channel.connect(), timeout=15.0)
+        # wait until connected
+        ok = await _wait_until_connected(vc, total_timeout=8.0, interval=0.4)
+        if ok:
+            await send_reply(ctx, f"✅ Reconnected to **{vc.channel.name}**.")
+        else:
+            await send_reply(ctx, "❌ Reconnect attempted but connection did not stabilize.")
+    except Exception as e:
+        await send_reply(ctx, f"❌ Reconnect failed: {e}")
+
+@bot.slash_command(name="join", description="Join your current voice channel")
+async def join(ctx: discord.ApplicationContext):
+    await safe_defer(ctx)
+    ok, msg = await ensure_voice_connection(ctx)
+    if ok:
+        await send_reply(ctx, f"✅ {msg} (in **{ctx.voice_client.channel.name}**)")
+    else:
+        await send_reply(ctx, f"❌ {msg}")
+
+@bot.slash_command(name="leave", description="Leave the voice channel")
+async def leave(ctx: discord.ApplicationContext):
+    await safe_defer(ctx)
+    if ctx.voice_client is None:
+        await send_reply(ctx, "❌ I'm not connected to a voice channel.")
+        return
+
+    gid = ctx.guild.id
+    if gid in recording_states:
+        try:
+            ctx.voice_client.stop_recording()
+        except Exception:
+            pass
+        recording_states.pop(gid, None)
+
+    try:
+        await ctx.voice_client.disconnect(force=True)
+        await send_reply(ctx, "✅ Disconnected from voice.")
+    except Exception as e:
+        await send_reply(ctx, f"❌ Failed to disconnect: {e}")
+
+@bot.slash_command(name="record_start", description="Start recording the voice channel")
+async def record_start(ctx: discord.ApplicationContext):
+    await safe_defer(ctx)
+
+    ok, msg = await ensure_voice_connection(ctx)
+    if not ok:
+        await send_reply(ctx, f"❌ {msg}")
+        return
+
+    gid = ctx.guild.id
+    if gid in recording_states:
+        await send_reply(ctx, "❌ Already recording! Use `/record_stop` first.")
+        return
+
+    await asyncio.sleep(0.2)  # tiny extra buffer
+
+    try:
+        sink_cls = choose_sink_cls()
+        sink = sink_cls()
+
+        ctx.voice_client.start_recording(sink, finished_callback, ctx.channel)
+
+        recording_states[gid] = {
+            "sink": sink,
+            "channel": ctx.channel,
+            "voice_client": ctx.voice_client
+        }
+
+        consent = discord.Embed(
+            title="🔴 Recording Started",
+            description=(
+                "**NOTICE**: This voice channel is now being recorded.\n\n"
+                "By speaking, you consent to being recorded. Leave the channel if you do not consent."
+            ),
+            color=discord.Color.red()
+        )
+        fmt = "MP3" if sink_cls.__name__.upper().startswith("MP3") else "WAV"
+        consent.set_footer(text=f"Recording format: {fmt}")
+        await send_reply(ctx, embed=consent)
+
+    except Exception as e:
+        recording_states.pop(gid, None)
+        await send_reply(ctx, f"❌ Failed to start recording: {e}")
+
+@bot.slash_command(name="record_stop", description="Stop recording and upload the audio files")
+async def record_stop(ctx: discord.ApplicationContext):
+    await safe_defer(ctx)
+    gid = ctx.guild.id
+
+    if gid not in recording_states:
+        await send_reply(ctx, "❌ No recording is currently running.")
+        return
+
+    if ctx.voice_client is None:
+        recording_states.pop(gid, None)
+        await send_reply(ctx, "❌ I'm not connected to a voice channel.")
+        return
+
+    try:
+        ctx.voice_client.stop_recording()  # triggers finished_callback
+        recording_states.pop(gid, None)
+        await send_reply(ctx, "⏹️ Recording stopped. Processing…")
+    except Exception as e:
+        recording_states.pop(gid, None)
+        await send_reply(ctx, f"❌ Failed to stop recording: {e}")
+
+@bot.slash_command(name="status", description="Check bot connection/recording status")
+async def status(ctx: discord.ApplicationContext):
+    await safe_defer(ctx)
+    embed = discord.Embed(title="🤖 Bot Status", color=discord.Color.blurple())
+
+    vc = ctx.voice_client
+    if vc and vc.is_connected():
+        embed.add_field(name="Voice Connection", value=f"✅ Connected to **{vc.channel.name}**", inline=False)
+    else:
+        embed.add_field(name="Voice Connection", value="❌ Not connected", inline=False)
+
+    rec = "🔴 Active" if ctx.guild.id in recording_states else "⚪ Inactive"
+    embed.add_field(name="Recording", value=rec, inline=False)
+
+    if ctx.author.voice and ctx.author.voice.channel:
+        embed.add_field(name="Your Voice Channel", value=ctx.author.voice.channel.name, inline=False)
+    else:
+        embed.add_field(name="Your Voice Channel", value="❌ Not in voice", inline=False)
+
+    await send_reply(ctx, embed=embed)
+
+# ─────────────── Recording finished callback ──────────────
+async def finished_callback(sink, channel: discord.TextChannel, *args):
+    """
+    Called by py-cord after stop_recording().
+    We’ll emit one file per speaker; then clean up temp files.
+    """
+    made_files = []
+    try:
+        if not sink.audio_data:
+            await channel.send("❌ No audio captured (no one spoke).")
+            return
+
+        files_to_send: list[discord.File] = []
+        gid = channel.guild.id
+
+        for user_id, audio in sink.audio_data.items():
+            ext = "mp3" if getattr(audio, "encoding", "") == "mp3" else "wav"
+            filename = f"recording_{gid}_{user_id}.{ext}"
+
+            try:
+                with open(filename, "wb") as f:
+                    f.write(audio.file.getvalue())
+                made_files.append(filename)
+
+                if os.path.getsize(filename) > 0:
+                    files_to_send.append(discord.File(filename))
+                else:
+                    print(f"[warn] Empty file produced: {filename}")
+            except Exception as e:
+                print(f"[error] Could not write {filename}: {e}")
+
+        if files_to_send:
+            mentions = ", ".join(f"<@{uid}>" for uid in sink.audio_data.keys())
+            await channel.send(f"🎧 Recording complete! Participants: {mentions}", files=files_to_send)
+        else:
+            await channel.send("❌ No valid audio files were generated.")
+
+    except Exception as e:
+        print(f"[error] finished_callback failed: {e}")
+        try:
+            await channel.send("❌ Error processing recording. Please try again.")
+        except Exception:
+            pass
+    finally:
+        for path in made_files:
+            try:
+                os.remove(path)
+            except Exception as rm_err:
+                print(f"[warn] Could not remove {path}: {rm_err}")
+
+# ─────────────────────── Entry Point ──────────────────────
+if __name__ == "__main__":
+    if keep_alive:
+        keep_alive()
+
+    if not TOKEN:
+        print("❌ DISCORD_TOKEN not found in env/secrets.")
+        print("Add it as DISCORD_TOKEN in your environment (e.g., .env).")
+        raise SystemExit(1)
+
+    bot.run(TOKEN)
