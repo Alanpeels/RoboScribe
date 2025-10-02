@@ -1,0 +1,5 @@
+discord.py[voice]==2.6.3
+discord-ext-voice-recv==0.1.6
+SpeechRecognition==3.8.1
+google-generativeai==1.0.0
+python-dotenv==1.0.0
