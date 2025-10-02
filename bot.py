@@ -7,6 +7,10 @@ import speech_recognition as sr
 import google.generativeai as genai
 from database import Database
 from audio_sink import WavAudioSink
+from flask import Flask
+import threading
+import bot  # Assuming your main bot code is in bot.py
+
 
 # Load environment variables
 load_dotenv()
@@ -241,3 +245,18 @@ async def view_id(interaction: discord.Interaction, transcript_id: int):
     await interaction.response.send_message(embed=embed)
 
 client.run(DISCORD_TOKEN)
+
+
+
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "RoboScribe Bot is running", 200
+
+if __name__ == "__main__":
+    # Run the bot in a separate thread so Flask can run in main thread
+    threading.Thread(target=lambda: bot.main()).start()
+
+    # Run Flask server on 0.0.0.0:8080 to listen on all interfaces
+    app.run(host="0.0.0.0", port=8080)
