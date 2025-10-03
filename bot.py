@@ -9,8 +9,6 @@ from database import Database
 from audio_sink import WavAudioSink
 from flask import Flask
 import threading
-import bot  # Assuming your main bot code is in bot.py
-
 
 # Load environment variables
 load_dotenv()
@@ -254,9 +252,13 @@ app = Flask(__name__)
 def home():
     return "RoboScribe Bot is running", 200
 
-if __name__ == "__main__":
-    # Run the bot in a separate thread so Flask can run in main thread
-    threading.Thread(target=lambda: bot.main()).start()
+def run_bot():
+    """Function to run the Discord bot"""
+    client.run(DISCORD_TOKEN)
 
-    # Run Flask server on 0.0.0.0:8080 to listen on all interfaces
+if __name__ == "__main__":
+    # Run the bot in a separate thread
+    threading.Thread(target=run_bot, daemon=True).start()
+    
+    # Run Flask server on 0.0.0.0:8080
     app.run(host="0.0.0.0", port=8080)
