@@ -36,13 +36,16 @@ async def on_ready():
 
 @tree.command(name="start_recording", description="Start recording voice channel")
 async def start_recording(interaction: discord.Interaction):
+    # Defer response immediately for potentially slow operations
+    await interaction.response.defer()
+    
     if not interaction.user.voice:
         embed = discord.Embed(
             title="❌ Error",
             description="You must be in a voice channel to start recording!",
             color=discord.Color.red()
         )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
         return
     
     channel = interaction.user.voice.channel
@@ -53,48 +56,59 @@ async def start_recording(interaction: discord.Interaction):
             description="A recording is already in progress in this server!",
             color=discord.Color.orange()
         )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
         return
     
-    # Connect to voice channel
-    voice_client = await channel.connect(cls=voice_recv.VoiceRecvClient)
-    
-    # Get participant IDs
-    participant_ids = [member.id for member in channel.members if not member.bot]
-    
-    # Create audio sink and start recording
-    filename = f'recording_{interaction.guild.id}.wav'
-    sink = WavAudioSink(filename)
-    voice_client.listen(sink)
-    
-    # Store recording info
-    active_recordings[interaction.guild.id] = {
-        'voice_client': voice_client,
-        'sink': sink,
-        'filename': filename,
-        'participants': participant_ids
-    }
-    
-    embed = discord.Embed(
-        title="🎙️ Recording Started",
-        description=f"Now recording in **{channel.name}**",
-        color=discord.Color.green()
-    )
-    embed.add_field(name="Participants", value=f"{len(participant_ids)} member(s)", inline=True)
-    embed.add_field(name="Status", value="🔴 Live", inline=True)
-    embed.set_footer(text="Use /stop_recording to finish")
-    await interaction.response.send_message(embed=embed)
+    try:
+        # Connect to voice channel
+        voice_client = await channel.connect(cls=voice_recv.VoiceRecvClient)
+        
+        # Get participant IDs
+        participant_ids = [member.id for member in channel.members if not member.bot]
+        
+        # Create audio sink and start recording
+        filename = f'recording_{interaction.guild.id}.wav'
+        sink = WavAudioSink(filename)
+        voice_client.listen(sink)
+        
+        # Store recording info
+        active_recordings[interaction.guild.id] = {
+            'voice_client': voice_client,
+            'sink': sink,
+            'filename': filename,
+            'participants': participant_ids
+        }
+        
+        embed = discord.Embed(
+            title="🎙️ Recording Started",
+            description=f"Now recording in **{channel.name}**",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="Participants", value=f"{len(participant_ids)} member(s)", inline=True)
+        embed.add_field(name="Status", value="🔴 Live", inline=True)
+        embed.set_footer(text="Use /stop_recording to finish")
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        embed = discord.Embed(
+            title="❌ Connection Error",
+            description=f"Failed to start recording: {str(e)}",
+            color=discord.Color.red()
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 @tree.command(name="stop_recording", description="Stop recording and process")
 @app_commands.describe(name="Name for this transcript")
 async def stop_recording(interaction: discord.Interaction, name: str):
+    # CRITICAL: Defer immediately to prevent timeout
+    await interaction.response.defer()
+    
     if interaction.guild.id not in active_recordings:
         embed = discord.Embed(
             title="❌ No Active Recording",
             description="There's no recording in progress!",
             color=discord.Color.red()
         )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
         return
     
     # Send initial processing message
@@ -103,7 +117,7 @@ async def stop_recording(interaction: discord.Interaction, name: str):
         description="Stopping recording and processing audio...",
         color=discord.Color.blue()
     )
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
     
     recording = active_recordings[interaction.guild.id]
     voice_client = recording['voice_client']
@@ -111,9 +125,18 @@ async def stop_recording(interaction: discord.Interaction, name: str):
     participants = recording['participants']
     
     # Stop recording
-    voice_client.stop_listening()
-    await voice_client.disconnect()
-    del active_recordings[interaction.guild.id]
+    try:
+        voice_client.stop_listening()
+        await voice_client.disconnect()
+        del active_recordings[interaction.guild.id]
+    except Exception as e:
+        embed = discord.Embed(
+            title="❌ Error Stopping Recording",
+            description=f"Failed to stop recording properly: {str(e)}",
+            color=discord.Color.red()
+        )
+        await interaction.edit_original_response(embed=embed)
+        return
     
     # Check if audio file has content
     try:
@@ -204,6 +227,9 @@ async def stop_recording(interaction: discord.Interaction, name: str):
 @tree.command(name="transcript", description="Search for transcripts")
 @app_commands.describe(search_term="Search term to find transcripts")
 async def transcript(interaction: discord.Interaction, search_term: str):
+    # Defer for database operations
+    await interaction.response.defer()
+    
     results = db.search_transcripts(search_term)
     
     if not results:
@@ -212,7 +238,7 @@ async def transcript(interaction: discord.Interaction, search_term: str):
             description=f"No transcripts found matching **'{search_term}'**",
             color=discord.Color.orange()
         )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
         return
     
     embed = discord.Embed(
@@ -234,11 +260,14 @@ async def transcript(interaction: discord.Interaction, search_term: str):
     else:
         embed.set_footer(text="Use /view_id [ID] to view a transcript")
     
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 @tree.command(name="view_id", description="View a transcript by ID")
 @app_commands.describe(transcript_id="ID of the transcript")
 async def view_id(interaction: discord.Interaction, transcript_id: int):
+    # Defer for database operations
+    await interaction.response.defer()
+    
     result = db.get_transcript(transcript_id)
     
     if not result:
@@ -247,7 +276,7 @@ async def view_id(interaction: discord.Interaction, transcript_id: int):
             description=f"No transcript found with ID `{transcript_id}`",
             color=discord.Color.red()
         )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
         return
     
     name, text, summary, date = result
@@ -270,7 +299,7 @@ async def view_id(interaction: discord.Interaction, transcript_id: int):
     if len(text) > 1000 or len(summary) > 1000:
         embed.set_footer(text="⚠️ Content truncated due to length")
     
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 # Flask setup
 app = Flask(__name__)
@@ -278,6 +307,10 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     return "RoboScribe Bot is running", 200
+
+@app.route("/health")
+def health():
+    return {"status": "healthy", "bot": "online"}, 200
 
 def run_bot():
     """Function to run the Discord bot"""
