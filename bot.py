@@ -9,6 +9,8 @@ from database import Database
 from audio_sink import WavAudioSink
 from flask import Flask
 import threading
+from pydub import AudioSegment
+from pydub.silence import split_on_silence
 
 # Load environment variables
 load_dotenv()
@@ -36,7 +38,6 @@ async def on_ready():
 
 @tree.command(name="start_recording", description="Start recording voice channel")
 async def start_recording(interaction: discord.Interaction):
-    # Defer response immediately for potentially slow operations
     await interaction.response.defer()
     
     if not interaction.user.voice:
@@ -60,18 +61,12 @@ async def start_recording(interaction: discord.Interaction):
         return
     
     try:
-        # Connect to voice channel
         voice_client = await channel.connect(cls=voice_recv.VoiceRecvClient)
-        
-        # Get participant IDs
         participant_ids = [member.id for member in channel.members if not member.bot]
-        
-        # Create audio sink and start recording
         filename = f'recording_{interaction.guild.id}.wav'
         sink = WavAudioSink(filename)
         voice_client.listen(sink)
         
-        # Store recording info
         active_recordings[interaction.guild.id] = {
             'voice_client': voice_client,
             'sink': sink,
@@ -96,10 +91,58 @@ async def start_recording(interaction: discord.Interaction):
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
 
+def transcribe_audio_chunks(filename):
+    """Transcribe audio file by splitting into chunks"""
+    try:
+        # Load audio file
+        audio = AudioSegment.from_wav(filename)
+        
+        # Split audio into 50-second chunks (leaving buffer for safety)
+        chunk_length_ms = 50000  # 50 seconds
+        chunks = []
+        
+        for i in range(0, len(audio), chunk_length_ms):
+            chunk = audio[i:i + chunk_length_ms]
+            chunks.append(chunk)
+        
+        # Transcribe each chunk
+        recognizer = sr.Recognizer()
+        full_transcript = []
+        
+        for idx, chunk in enumerate(chunks):
+            # Export chunk to temporary file
+            chunk_filename = f"temp_chunk_{idx}.wav"
+            chunk.export(chunk_filename, format="wav")
+            
+            try:
+                with sr.AudioFile(chunk_filename) as source:
+                    audio_data = recognizer.record(source)
+                    text = recognizer.recognize_google(audio_data)
+                    if text:
+                        full_transcript.append(text)
+            except sr.UnknownValueError:
+                # Chunk had no speech, skip
+                pass
+            except Exception as e:
+                print(f"Error transcribing chunk {idx}: {e}")
+            finally:
+                # Clean up temp chunk file
+                if os.path.exists(chunk_filename):
+                    os.remove(chunk_filename)
+        
+        if not full_transcript:
+            return None
+        
+        # Join all transcripts with spaces
+        return " ".join(full_transcript)
+        
+    except Exception as e:
+        print(f"Error in chunking: {e}")
+        return None
+
 @tree.command(name="stop_recording", description="Stop recording and process")
 @app_commands.describe(name="Name for this transcript")
 async def stop_recording(interaction: discord.Interaction, name: str):
-    # CRITICAL: Defer immediately to prevent timeout
     await interaction.response.defer()
     
     if interaction.guild.id not in active_recordings:
@@ -111,7 +154,6 @@ async def stop_recording(interaction: discord.Interaction, name: str):
         await interaction.followup.send(embed=embed, ephemeral=True)
         return
     
-    # Send initial processing message
     embed = discord.Embed(
         title="⏳ Processing Recording",
         description="Stopping recording and processing audio...",
@@ -124,7 +166,6 @@ async def stop_recording(interaction: discord.Interaction, name: str):
     filename = recording['filename']
     participants = recording['participants']
     
-    # Stop recording
     try:
         voice_client.stop_listening()
         await voice_client.disconnect()
@@ -138,15 +179,13 @@ async def stop_recording(interaction: discord.Interaction, name: str):
         await interaction.edit_original_response(embed=embed)
         return
     
-    # Check if audio file has content
     try:
         file_size = os.path.getsize(filename)
         
-        # Check if file is too small (less than 1KB likely means no real audio)
         if file_size < 1024:
             embed = discord.Embed(
                 title="🔇 No Audio Detected",
-                description="The recording contains no speech or is too short. Please try again with:\n• Someone speaking clearly\n• Longer recording duration\n• Check microphone permissions",
+                description="The recording contains no speech or is too short. Please try again.",
                 color=discord.Color.orange()
             )
             await interaction.edit_original_response(embed=embed)
@@ -161,39 +200,25 @@ async def stop_recording(interaction: discord.Interaction, name: str):
         await interaction.edit_original_response(embed=embed)
         return
     
-    # Transcribe audio
-    try:
-        recognizer = sr.Recognizer()
-        with sr.AudioFile(filename) as source:
-            audio = recognizer.record(source)
-            transcript_text = recognizer.recognize_google(audio)
-    except sr.UnknownValueError:
+    # Update status message
+    embed = discord.Embed(
+        title="⏳ Transcribing Audio",
+        description="Processing audio chunks... This may take a moment for longer recordings.",
+        color=discord.Color.blue()
+    )
+    await interaction.edit_original_response(embed=embed)
+    
+    # Transcribe using chunking
+    transcript_text = transcribe_audio_chunks(filename)
+    
+    if not transcript_text:
         embed = discord.Embed(
             title="🔇 No Speech Detected",
-            description="Could not detect any speech in the recording. Please ensure:\n• Clear speech\n• Minimal background noise\n• Someone actually spoke during recording\n• Recording wasn't too short",
+            description="Could not detect any speech in the recording. Please ensure clear speech with minimal background noise.",
             color=discord.Color.red()
         )
         await interaction.edit_original_response(embed=embed)
         os.remove(filename)
-        return
-    except sr.RequestError as e:
-        embed = discord.Embed(
-            title="❌ Service Error",
-            description=f"Transcription service error: {e}",
-            color=discord.Color.red()
-        )
-        await interaction.edit_original_response(embed=embed)
-        os.remove(filename)
-        return
-    except Exception as e:
-        embed = discord.Embed(
-            title="❌ Error Processing Audio",
-            description=f"An unexpected error occurred: {e}",
-            color=discord.Color.red()
-        )
-        await interaction.edit_original_response(embed=embed)
-        if os.path.exists(filename):
-            os.remove(filename)
         return
     
     # Generate AI summary
@@ -208,11 +233,11 @@ async def stop_recording(interaction: discord.Interaction, name: str):
     # Save to database
     transcript_id = db.save_transcript(name, transcript_text, summary, participants)
     
-    # Cleanup audio file
+    # Cleanup
     if os.path.exists(filename):
         os.remove(filename)
     
-    # Send success message
+    # Success message
     embed = discord.Embed(
         title="✅ Transcript Saved",
         description=f"Recording **'{name}'** has been processed and saved!",
@@ -227,7 +252,6 @@ async def stop_recording(interaction: discord.Interaction, name: str):
 @tree.command(name="transcript", description="Search for transcripts")
 @app_commands.describe(search_term="Search term to find transcripts")
 async def transcript(interaction: discord.Interaction, search_term: str):
-    # Defer for database operations
     await interaction.response.defer()
     
     results = db.search_transcripts(search_term)
@@ -247,7 +271,7 @@ async def transcript(interaction: discord.Interaction, search_term: str):
         color=discord.Color.blue()
     )
     
-    for idx, (transcript_id, name, date) in enumerate(results[:10], 1):  # Limit to 10 results
+    for idx, (transcript_id, name, date) in enumerate(results[:10], 1):
         date_formatted = date[:10] if len(date) >= 10 else date
         embed.add_field(
             name=f"{idx}. {name}",
@@ -265,7 +289,6 @@ async def transcript(interaction: discord.Interaction, search_term: str):
 @tree.command(name="view_id", description="View a transcript by ID")
 @app_commands.describe(transcript_id="ID of the transcript")
 async def view_id(interaction: discord.Interaction, transcript_id: int):
-    # Defer for database operations
     await interaction.response.defer()
     
     result = db.get_transcript(transcript_id)
@@ -289,7 +312,6 @@ async def view_id(interaction: discord.Interaction, transcript_id: int):
     embed.add_field(name="📅 Date", value=date_formatted, inline=True)
     embed.add_field(name="🆔 ID", value=f"`{transcript_id}`", inline=True)
     
-    # Truncate text if too long (Discord has 1024 char limit per field)
     transcript_display = text[:1000] + "..." if len(text) > 1000 else text
     summary_display = summary[:1000] + "..." if len(summary) > 1000 else summary
     
@@ -317,8 +339,5 @@ def run_bot():
     client.run(DISCORD_TOKEN)
 
 if __name__ == "__main__":
-    # Run the bot in a separate thread
     threading.Thread(target=run_bot, daemon=True).start()
-    
-    # Run Flask server on 0.0.0.0:8080 to listen on all interfaces
     app.run(host="0.0.0.0", port=8080)
