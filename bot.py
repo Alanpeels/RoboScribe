@@ -22,7 +22,6 @@ genai.configure(api_key=GEMINI_API_KEY)
 intents = discord.Intents.default()
 intents.voice_states = True
 intents.guilds = True
-
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 db = Database()
@@ -84,7 +83,6 @@ async def start_recording(interaction: discord.Interaction):
     embed.add_field(name="Participants", value=f"{len(participant_ids)} member(s)", inline=True)
     embed.add_field(name="Status", value="🔴 Live", inline=True)
     embed.set_footer(text="Use /stop_recording to finish")
-    
     await interaction.response.send_message(embed=embed)
 
 @tree.command(name="stop_recording", description="Stop recording and process")
@@ -115,8 +113,30 @@ async def stop_recording(interaction: discord.Interaction, name: str):
     # Stop recording
     voice_client.stop_listening()
     await voice_client.disconnect()
-    
     del active_recordings[interaction.guild.id]
+    
+    # Check if audio file has content
+    try:
+        file_size = os.path.getsize(filename)
+        
+        # Check if file is too small (less than 1KB likely means no real audio)
+        if file_size < 1024:
+            embed = discord.Embed(
+                title="🔇 No Audio Detected",
+                description="The recording contains no speech or is too short. Please try again with:\n• Someone speaking clearly\n• Longer recording duration\n• Check microphone permissions",
+                color=discord.Color.orange()
+            )
+            await interaction.edit_original_response(embed=embed)
+            os.remove(filename)
+            return
+    except FileNotFoundError:
+        embed = discord.Embed(
+            title="❌ Recording Error",
+            description="Audio file was not created. Please try again.",
+            color=discord.Color.red()
+        )
+        await interaction.edit_original_response(embed=embed)
+        return
     
     # Transcribe audio
     try:
@@ -126,8 +146,8 @@ async def stop_recording(interaction: discord.Interaction, name: str):
             transcript_text = recognizer.recognize_google(audio)
     except sr.UnknownValueError:
         embed = discord.Embed(
-            title="❌ Transcription Failed",
-            description="Could not understand the audio. Please ensure:\n• Clear speech\n• Minimal background noise\n• Audio is not too long",
+            title="🔇 No Speech Detected",
+            description="Could not detect any speech in the recording. Please ensure:\n• Clear speech\n• Minimal background noise\n• Someone actually spoke during recording\n• Recording wasn't too short",
             color=discord.Color.red()
         )
         await interaction.edit_original_response(embed=embed)
@@ -141,6 +161,16 @@ async def stop_recording(interaction: discord.Interaction, name: str):
         )
         await interaction.edit_original_response(embed=embed)
         os.remove(filename)
+        return
+    except Exception as e:
+        embed = discord.Embed(
+            title="❌ Error Processing Audio",
+            description=f"An unexpected error occurred: {e}",
+            color=discord.Color.red()
+        )
+        await interaction.edit_original_response(embed=embed)
+        if os.path.exists(filename):
+            os.remove(filename)
         return
     
     # Generate AI summary
@@ -156,7 +186,8 @@ async def stop_recording(interaction: discord.Interaction, name: str):
     transcript_id = db.save_transcript(name, transcript_text, summary, participants)
     
     # Cleanup audio file
-    os.remove(filename)
+    if os.path.exists(filename):
+        os.remove(filename)
     
     # Send success message
     embed = discord.Embed(
@@ -168,7 +199,6 @@ async def stop_recording(interaction: discord.Interaction, name: str):
     embed.add_field(name="Participants", value=f"{len(participants)} member(s)", inline=True)
     embed.add_field(name="Preview", value=transcript_text[:100] + "..." if len(transcript_text) > 100 else transcript_text, inline=False)
     embed.set_footer(text=f"Use /view_id {transcript_id} to see the full transcript")
-    
     await interaction.edit_original_response(embed=embed)
 
 @tree.command(name="transcript", description="Search for transcripts")
@@ -242,10 +272,7 @@ async def view_id(interaction: discord.Interaction, transcript_id: int):
     
     await interaction.response.send_message(embed=embed)
 
-client.run(DISCORD_TOKEN)
-
-
-
+# Flask setup
 app = Flask(__name__)
 
 @app.route("/")
@@ -260,5 +287,5 @@ if __name__ == "__main__":
     # Run the bot in a separate thread
     threading.Thread(target=run_bot, daemon=True).start()
     
-    # Run Flask server on 0.0.0.0:8080
+    # Run Flask server on 0.0.0.0:8080 to listen on all interfaces
     app.run(host="0.0.0.0", port=8080)
