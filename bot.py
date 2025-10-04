@@ -92,12 +92,28 @@ async def start_recording(interaction: discord.Interaction):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
 def transcribe_audio_chunks(filename):
-    """Transcribe audio file by splitting into chunks"""
+    """Transcribe audio file, using chunking only if necessary"""
     try:
-        # Load audio file
+        # Check audio duration first
         audio = AudioSegment.from_wav(filename)
+        duration_seconds = len(audio) / 1000  # Convert ms to seconds
         
-        # Split audio into 50-second chunks (leaving buffer for safety)
+        recognizer = sr.Recognizer()
+        
+        # If audio is under 50 seconds, transcribe directly without chunking
+        if duration_seconds <= 50:
+            try:
+                with sr.AudioFile(filename) as source:
+                    audio_data = recognizer.record(source)
+                    text = recognizer.recognize_google(audio_data)
+                    return text
+            except sr.UnknownValueError:
+                return None
+            except Exception as e:
+                print(f"Error in direct transcription: {e}")
+                return None
+        
+        # For longer audio, use chunking
         chunk_length_ms = 50000  # 50 seconds
         chunks = []
         
@@ -106,11 +122,9 @@ def transcribe_audio_chunks(filename):
             chunks.append(chunk)
         
         # Transcribe each chunk
-        recognizer = sr.Recognizer()
         full_transcript = []
         
         for idx, chunk in enumerate(chunks):
-            # Export chunk to temporary file
             chunk_filename = f"temp_chunk_{idx}.wav"
             chunk.export(chunk_filename, format="wav")
             
@@ -121,24 +135,22 @@ def transcribe_audio_chunks(filename):
                     if text:
                         full_transcript.append(text)
             except sr.UnknownValueError:
-                # Chunk had no speech, skip
                 pass
             except Exception as e:
                 print(f"Error transcribing chunk {idx}: {e}")
             finally:
-                # Clean up temp chunk file
                 if os.path.exists(chunk_filename):
                     os.remove(chunk_filename)
         
         if not full_transcript:
             return None
         
-        # Join all transcripts with spaces
         return " ".join(full_transcript)
         
     except Exception as e:
-        print(f"Error in chunking: {e}")
+        print(f"Error in transcription: {e}")
         return None
+
 
 @tree.command(name="stop_recording", description="Stop recording and process")
 @app_commands.describe(name="Name for this transcript")
