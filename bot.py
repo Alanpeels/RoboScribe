@@ -321,7 +321,9 @@ async def view_id(interaction: discord.Interaction, transcript_id: int):
     if len(text) > 1000 or len(summary) > 1000:
         embed.set_footer(text="⚠️ Content truncated due to length")
     
+    # THIS LINE WAS MISSING OR BROKEN
     await interaction.followup.send(embed=embed)
+
 
 # Flask setup
 app = Flask(__name__)
