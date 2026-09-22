@@ -2,6 +2,8 @@ import sqlite3
 from datetime import datetime
 import threading
 
+
+#test
 class Database:
     def __init__(self, db_file='transcripts.db'):
         self.db_file = db_file
